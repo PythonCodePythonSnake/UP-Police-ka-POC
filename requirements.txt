@@ -1,0 +1,4 @@
+pydantic
+pydantic_settings
+httpx
+fastapi[standard]
