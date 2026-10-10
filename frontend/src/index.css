@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Optional: A tiny bit of custom scrollbar styling for a cleaner look */
+@layer utilities {
+  .scroll-smooth::-webkit-scrollbar {
+    width: 6px;
+  }
+  .scroll-smooth::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scroll-smooth::-webkit-scrollbar-thumb {
+    background-color: #cbd5e1;
+    border-radius: 20px;
+  }
+}
