@@ -98,6 +98,9 @@ class SessionService:
 
     def save(self, session: SessionData) -> SessionData:
         """Persist changes (refreshing updated_at, which also extends the expiry window)."""
+        if not self._path(session.session_id).exists():
+            raise SessionNotFoundError("Session not found.")
+        
         session.updated_at = _now()
         self._write(session)
         return session
@@ -121,6 +124,20 @@ class SessionService:
             updated_at=session.updated_at,
             expires_at=self.expires_at(session),
         )
+
+    def purge_expired(self) -> int:
+        """Delete all expired session files and return the number removed."""
+        removed = 0
+        for path in self._dir.glob("*.json"):
+            try:
+                # get() automatically unlinks the file and raises SessionExpiredError if expired
+                self.get(path.stem)
+            except SessionExpiredError:
+                removed += 1
+            except SessionError:
+                # Ignore corrupt or not-found files during the purge
+                pass
+        return removed
 
     # ------------------------------------------------------------------ #
     # Internals

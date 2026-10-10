@@ -14,6 +14,7 @@ class Settings(BaseSettings):
         env_file=BACKEND_DIR / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        env_ignore_empty=True,  # Fix: Ignore blank values so defaults can take over
     )
 
     # Application

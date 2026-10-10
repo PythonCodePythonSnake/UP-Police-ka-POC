@@ -61,6 +61,9 @@ def add_message(
 
 def get_history(session: SessionData, limit: int = MAX_HISTORY_MESSAGES) -> list[ChatMessage]:
     """Most recent messages, always starting with a user message (some providers require it)."""
+    if limit <= 0:
+        return []
+        
     history = session.messages[-limit:]
     while history and history[0].role != "user":
         history = history[1:]

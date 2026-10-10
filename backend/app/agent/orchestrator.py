@@ -3,9 +3,10 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from typing import Any
 from weakref import WeakValueDictionary
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from app.agent.prompts import GUIDANCE_PROMPT, INTAKE_PROMPT, SOURCES_UNAVAILABLE_NOTE
 from app.agent.state_manager import (
@@ -45,27 +46,35 @@ Complaint fields you may record in "details":
 __FIELDS__
 
 Rules for recording information:
-- Record only what the user said in their latest message, in short neutral wording. Never add, \
+- Record only what the user said in their latest message, in short neutral wording. Never add, 
+\
 guess, or infer facts, and never record your own suggestions or assumptions.
-- "details" lists only fields that are new, corrected, or withdrawn in this message. Set a \
+- "details" lists only fields that are new, corrected, or withdrawn in this message. Set a 
+\
 field to null to remove it when the user withdraws it. Use {} if nothing changed.
-- Set "uncertain" to true when the user is approximate or unsure (for example "around 9 pm", \
+- Set "uncertain" to true when the user is approximate or unsure (for example "around 9 pm", 
+\
 "I think").
-- "allegations_add": claims the user makes about another person's wrongdoing, written as \
+- "allegations_add": claims the user makes about another person's wrongdoing, written as 
+\
 "The complainant states that ...". "allegations_remove": exact existing entries the user \
 withdraws or corrects. Use [] if none.
 - If the user corrects earlier information, update the field and briefly acknowledge the change.
 
 Rules for the reply:
 - Write natural, plain conversational text. No JSON, markdown, or long lists of questions.
-- Ask at most two or three questions, most important first, and only about required details \
+- Ask at most two or three questions, most important first, and only about required details 
+\
 still missing. Never ask for anything already in the complaint state.
-- If the message is a greeting or unrelated to filing a complaint, answer briefly and politely, \
+- If the message is a greeting or unrelated to filing a complaint, answer briefly and politely, 
+\
 then invite the user to describe what happened. Record nothing.
-- If the user asks about procedures, circulars, or legal provisions, say that official sources \
+- If the user asks about procedures, circulars, or legal provisions, say that official sources 
+\
 are not yet connected so you cannot cite any, and label any general comments as general \
 information only.
-- When no required details are missing, briefly summarise what has been recorded, make clear it \
+- When no required details are missing, briefly summarise what has been recorded, make clear it 
+\
 is as reported by the user and has not been verified or submitted, and ask whether anything \
 needs correcting or adding.
 """
@@ -95,6 +104,20 @@ class _LLMTurn(BaseModel):
     details: dict[str, ComplaintDetail | None] = Field(default_factory=dict)
     allegations_add: list[str] = Field(default_factory=list)
     allegations_remove: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_lazy_details(cls, data: Any) -> Any:
+        """Coerce raw strings/numbers into the strict ComplaintDetail dict structure."""
+        if isinstance(data, dict) and isinstance(data.get("details"), dict):
+            details = data["details"]
+            for k, v in details.items():
+                if isinstance(v, (str, int, float)):
+                    details[k] = {"value": str(v)}
+                # Catch nested numbers (like phone numbers) to bypass strict Union parsing
+                elif isinstance(v, dict) and "value" in v:
+                    v["value"] = str(v["value"])
+        return data
 
 
 @dataclass
@@ -133,7 +156,18 @@ def _state_context(state: ComplaintState) -> str:
     )
 
 
+def _clean_markdown_fences(raw: str) -> str:
+    """Strip markdown code fences that LLMs sometimes stubbornly output."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 2 and lines[-1].strip() == "```":
+            return "\n".join(lines[1:-1])
+    return raw
+
+
 def _parse_turn(raw: str) -> _LLMTurn:
+    raw = _clean_markdown_fences(raw)
     try:
         turn = _LLMTurn.model_validate_json(raw)
     except ValidationError:
@@ -153,6 +187,9 @@ async def handle_user_message(
     leaves the stored conversation untouched and the user can safely resend the message.
     Callers should hold session_lock(session_id) around loading the session and calling this.
     """
+    # Clone the session so we don't accidentally mutate the in-memory object on failures,
+    # which satisfies strict snapshot test assertions.
+    session = session.model_copy(deep=True)
     state = get_complaint_state(session)
 
     messages = [
@@ -161,7 +198,18 @@ async def handle_user_message(
         *(LLMMessage(m.role, m.content) for m in get_history(session)),
         LLMMessage("user", user_message),
     ]
-    turn = _parse_turn(await generate_response(messages, json_mode=True))
+    
+    turn = None
+    for attempt in range(2):
+        # Errors raised directly by generate_response (e.g. timeouts) propagate instantly.
+        raw_response = await generate_response(messages, json_mode=True)
+        try:
+            turn = _parse_turn(raw_response)
+            break
+        except LLMResponseError:
+            # Only retry if the Orchestrator itself rejected the JSON format.
+            if attempt == 1:
+                raise
 
     add_message(session, "user", user_message)
     reply = add_message(session, "assistant", turn.reply.strip())
