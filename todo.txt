@@ -1,2 +1,11 @@
-Everything is working
-But backend is a fixed loop not interactive, that is next todo
+Congrats the interactive thing is setup...it works in the docs right now, haven't tested with frontend yet
+
+Problems:
+1. If i give it like yesterday evening or so...it is recording that...but we need to save date as well
+
+To be checked:
+1. Whether it can handle the random stuff or not, like i asked for cpp code it refused good...but if say waahhh, i am scared...what does it do
+2. Jailbreak- whether it leaks code stuff if asked
+
+Note:
+Check evidence/

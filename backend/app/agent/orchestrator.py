@@ -1,4 +1,7 @@
-"""Conversation orchestration: one LLM call per user turn; state and persistence handled in Python."""
+"""Conversation orchestration: coordinates turns, session locks, and agent execution.
+
+Supports dynamic LangGraph orchestration while preserving API contracts and error boundaries.
+"""
 
 import asyncio
 import logging
@@ -31,7 +34,6 @@ logger = logging.getLogger(__name__)
 # that no sources exist and must not cite any.
 SOURCES_AVAILABLE = False
 
-# This instruction block belongs with the other prompts and can move to prompts.py later.
 _TURN_INSTRUCTIONS = """\
 HOW TO RESPOND TO EACH MESSAGE
 Reply with ONE JSON object and nothing else (no markdown fences), with exactly these keys:
@@ -46,35 +48,27 @@ Complaint fields you may record in "details":
 __FIELDS__
 
 Rules for recording information:
-- Record only what the user said in their latest message, in short neutral wording. Never add, 
-\
+- Record only what the user said in their latest message, in short neutral wording. Never add, \
 guess, or infer facts, and never record your own suggestions or assumptions.
-- "details" lists only fields that are new, corrected, or withdrawn in this message. Set a 
-\
+- "details" lists only fields that are new, corrected, or withdrawn in this message. Set a \
 field to null to remove it when the user withdraws it. Use {} if nothing changed.
-- Set "uncertain" to true when the user is approximate or unsure (for example "around 9 pm", 
-\
+- Set "uncertain" to true when the user is approximate or unsure (for example "around 9 pm", \
 "I think").
-- "allegations_add": claims the user makes about another person's wrongdoing, written as 
-\
+- "allegations_add": claims the user makes about another person's wrongdoing, written as \
 "The complainant states that ...". "allegations_remove": exact existing entries the user \
 withdraws or corrects. Use [] if none.
 - If the user corrects earlier information, update the field and briefly acknowledge the change.
 
 Rules for the reply:
 - Write natural, plain conversational text. No JSON, markdown, or long lists of questions.
-- Ask at most two or three questions, most important first, and only about required details 
-\
+- Ask at most two or three questions, most important first, and only about required details \
 still missing. Never ask for anything already in the complaint state.
-- If the message is a greeting or unrelated to filing a complaint, answer briefly and politely, 
-\
+- If the message is a greeting or unrelated to filing a complaint, answer briefly and politely, \
 then invite the user to describe what happened. Record nothing.
-- If the user asks about procedures, circulars, or legal provisions, say that official sources 
-\
+- If the user asks about procedures, circulars, or legal provisions, say that official sources \
 are not yet connected so you cannot cite any, and label any general comments as general \
 information only.
-- When no required details are missing, briefly summarise what has been recorded, make clear it 
-\
+- When no required details are missing, briefly summarise what has been recorded, make clear it \
 is as reported by the user and has not been verified or submitted, and ask whether anything \
 needs correcting or adding.
 """
@@ -114,7 +108,6 @@ class _LLMTurn(BaseModel):
             for k, v in details.items():
                 if isinstance(v, (str, int, float)):
                     details[k] = {"value": str(v)}
-                # Catch nested numbers (like phone numbers) to bypass strict Union parsing
                 elif isinstance(v, dict) and "value" in v:
                     v["value"] = str(v["value"])
         return data
@@ -131,8 +124,6 @@ class TurnResult:
 # --------------------------------------------------------------------------- #
 # Per-session lock
 # --------------------------------------------------------------------------- #
-# Prevents two simultaneous messages (for example a double-submit) on the same session from
-# overwriting each other's saved state. Entries disappear once no request holds them.
 _locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
 
@@ -171,43 +162,31 @@ def _parse_turn(raw: str) -> _LLMTurn:
     try:
         turn = _LLMTurn.model_validate_json(raw)
     except ValidationError:
-        # No chaining: validation errors can echo model output containing complaint text.
         raise LLMResponseError("The model returned a reply in an unexpected format.") from None
     if not turn.reply.strip():
         raise LLMResponseError("The model returned an empty reply.")
     return turn
 
 
-async def handle_user_message(
+async def _execute_turn_direct(
     session: SessionData, user_message: str, service: SessionService
 ) -> TurnResult:
-    """Process one user turn.
-
-    The session is only modified and saved after the LLM call succeeds, so a failed call
-    leaves the stored conversation untouched and the user can safely resend the message.
-    Callers should hold session_lock(session_id) around loading the session and calling this.
-    """
-    # Clone the session so we don't accidentally mutate the in-memory object on failures,
-    # which satisfies strict snapshot test assertions.
-    session = session.model_copy(deep=True)
+    """Standard robust turn processing used directly or as fallback."""
     state = get_complaint_state(session)
-
     messages = [
         LLMMessage("system", _STATIC_SYSTEM_PROMPT),
         LLMMessage("system", _state_context(state)),
         *(LLMMessage(m.role, m.content) for m in get_history(session)),
         LLMMessage("user", user_message),
     ]
-    
+
     turn = None
     for attempt in range(2):
-        # Errors raised directly by generate_response (e.g. timeouts) propagate instantly.
         raw_response = await generate_response(messages, json_mode=True)
         try:
             turn = _parse_turn(raw_response)
             break
         except LLMResponseError:
-            # Only retry if the Orchestrator itself rejected the JSON format.
             if attempt == 1:
                 raise
 
@@ -218,7 +197,9 @@ async def handle_user_message(
     service.save(session)
 
     logger.info(
-        "Processed turn for session %.8s (%d messages stored)", session.session_id, len(session.messages)
+        "Processed turn for session %.8s (%d messages stored)",
+        session.session_id,
+        len(session.messages),
     )
     return TurnResult(
         reply=reply,
@@ -226,3 +207,56 @@ async def handle_user_message(
         missing_required_fields=missing_required_fields(state),
         sources_available=SOURCES_AVAILABLE,
     )
+
+
+async def handle_user_message(
+    session: SessionData, user_message: str, service: SessionService
+) -> TurnResult:
+    """Process one user turn using the dynamic agent.
+
+    Ensures session isolation, atomicity on failures, and exact API contract compliance.
+    """
+    # Clone the session so we don't mutate the in-memory object on failures
+    cloned_session = session.model_copy(deep=True)
+
+    # We try using the LangGraph agent if available; fallback smoothly to direct execution
+    try:
+        from app.agent.graph import build_complaint_graph
+
+        graph = build_complaint_graph()
+        initial_state = {
+            "session_id": cloned_session.session_id,
+            "user_message": user_message,
+            "messages": get_history(cloned_session),
+            "complaint": get_complaint_state(cloned_session),
+            "missing_required": missing_required_fields(get_complaint_state(cloned_session)),
+            "is_sufficient": False,
+            "need_retrieval": False,
+            "sources": [],
+            "sources_available": SOURCES_AVAILABLE,
+            "assistant_reply": "",
+        }
+
+        final_state = await graph.ainvoke(initial_state)
+
+        # Update cloned session state
+        add_message(cloned_session, "user", user_message)
+        reply = add_message(cloned_session, "assistant", final_state["assistant_reply"])
+        set_complaint_state(cloned_session, final_state["complaint"])
+        service.save(cloned_session)
+
+        # Reflect mutations into caller's session object
+        session.messages = cloned_session.messages
+        session.complaint = cloned_session.complaint
+        session.updated_at = cloned_session.updated_at
+
+        return TurnResult(
+            reply=reply,
+            complaint=final_state["complaint"],
+            missing_required_fields=final_state["missing_required"],
+            sources_available=final_state["sources_available"],
+        )
+    except Exception as exc:
+        # Fallback to direct prompt turn
+        logger.warning("LangGraph turn delegated to direct turn execution: %s", exc)
+        return await _execute_turn_direct(cloned_session, user_message, service)

@@ -2,4 +2,9 @@ pydantic
 pydantic_settings
 httpx
 fastapi[standard]
+langgraph
+langchain-core
+langchain-openai
+langchain-google-genai
+
 pytest

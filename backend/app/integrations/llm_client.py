@@ -1,10 +1,11 @@
-"""LLM integration: one async interface over OpenAI and Google Gemini (REST via httpx)."""
+"""LLM integration: interface supporting OpenAI and Google Gemini via LangChain and direct async calls."""
 
 import logging
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
+from pydantic import SecretStr
 
 from app.core.config import settings
 
@@ -15,7 +16,7 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:ge
 
 
 # --------------------------------------------------------------------------- #
-# Public types
+# Public types & Exceptions
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class LLMMessage:
@@ -48,7 +49,7 @@ class LLMResponseError(LLMError):
 
 
 # --------------------------------------------------------------------------- #
-# Shared HTTP client
+# Shared HTTP client for REST generation
 # --------------------------------------------------------------------------- #
 _client: httpx.AsyncClient | None = None
 
@@ -101,7 +102,7 @@ async def _post_json(
 
 
 # --------------------------------------------------------------------------- #
-# Providers
+# REST Providers (Direct HTTP)
 # --------------------------------------------------------------------------- #
 async def _generate_openai(
     messages: list[LLMMessage], api_key: str, json_mode: bool, temperature: float | None
@@ -113,7 +114,6 @@ async def _generate_openai(
     if temperature is not None:
         payload["temperature"] = temperature
     if json_mode:
-        # OpenAI requires the word "JSON" to appear somewhere in the messages.
         payload["response_format"] = {"type": "json_object"}
 
     data = await _post_json(
@@ -175,23 +175,13 @@ _PROVIDERS = {
 }
 
 
-# --------------------------------------------------------------------------- #
-# Public interface
-# --------------------------------------------------------------------------- #
 async def generate_response(
     messages: list[LLMMessage],
     *,
     json_mode: bool = False,
     temperature: float | None = None,
 ) -> str:
-    """Send messages to the configured provider and return the reply text.
-
-    json_mode asks the provider for a JSON-only reply (for later structured extraction);
-    the caller is responsible for parsing and validating the returned string.
-    temperature is omitted from the request unless given, since some models reject it.
-
-    Raises LLMConfigurationError, LLMTimeoutError, LLMProviderError, or LLMResponseError.
-    """
+    """Send messages to the configured provider and return the reply text."""
     if not messages:
         raise ValueError("messages must not be empty.")
 
@@ -205,7 +195,63 @@ async def generate_response(
     if settings.llm_api_key is None:
         raise LLMConfigurationError("LLM_API_KEY is not set.")
 
-    logger.debug("LLM request: provider=%s model=%s messages=%d", provider, settings.llm_model, len(messages))
+    logger.debug(
+        "LLM request: provider=%s model=%s messages=%d",
+        provider,
+        settings.llm_model,
+        len(messages),
+    )
     return await generator(
         messages, settings.llm_api_key.get_secret_value(), json_mode, temperature
     )
+
+
+# --------------------------------------------------------------------------- #
+# LangChain Chat Model Factory
+# --------------------------------------------------------------------------- #
+def get_chat_model(temperature: float = 0.0) -> Any:
+    """Return an initialized LangChain ChatModel instance for the configured provider.
+
+    Supports both 'openai' and 'gemini'.
+    Raises LLMConfigurationError if configuration or API key is missing.
+    """
+    provider = settings.llm_provider.strip().lower()
+    if settings.llm_api_key is None:
+        raise LLMConfigurationError("LLM_API_KEY is not set.")
+
+    api_key_str = settings.llm_api_key.get_secret_value()
+
+    if provider == "openai":
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError as exc:
+            raise LLMConfigurationError("langchain-openai package is not installed.") from exc
+
+        return ChatOpenAI(
+            model=settings.llm_model,
+            api_key=SecretStr(api_key_str),
+            temperature=temperature,
+            timeout=settings.llm_timeout_seconds,
+        )
+
+    elif provider == "gemini":
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+        except ImportError as exc:
+            raise LLMConfigurationError(
+                "langchain-google-genai package is not installed."
+            ) from exc
+
+        model_name = settings.llm_model.removeprefix("models/")
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=api_key_str,
+            temperature=temperature,
+            timeout=settings.llm_timeout_seconds,
+        )
+
+    else:
+        supported = ", ".join(sorted(_PROVIDERS))
+        raise LLMConfigurationError(
+            f"Unsupported LLM_PROVIDER '{settings.llm_provider}'. Supported: {supported}."
+        )
